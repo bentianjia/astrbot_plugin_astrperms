@@ -1,0 +1,6 @@
+name: astrperms
+author: Claude
+desc: 类似 LuckPerms 的权限管理插件，支持用户/组权限设置，全局生效
+version: 1.0.0
+repo: https://github.com/user/astrbot_plugin_astrperms
+display_name: AstrPerms - 权限管理

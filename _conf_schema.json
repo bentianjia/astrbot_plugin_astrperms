@@ -1,0 +1,15 @@
+{
+  "default_mode": {
+    "type": "select",
+    "label": "默认权限模式",
+    "options": ["allow", "deny"],
+    "default": "allow",
+    "description": "未明确设置权限时的默认行为：allow=允许所有(白名单模式)，deny=拒绝所有(黑名单模式)"
+  },
+  "admin_bypass": {
+    "type": "boolean",
+    "label": "管理员豁免",
+    "default": true,
+    "description": "机器人管理员是否豁免所有权限检查"
+  }
+}
