@@ -39,6 +39,7 @@ AstrPerms — LuckPerms 风格权限管理插件 for AstrBot
   5. 默认模式 (config: default_mode = allow / deny)
 """
 
+import copy
 import json
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -317,16 +318,18 @@ class AstrPerms(Star):
         if "*" in perms:
             return bool(perms["*"])
 
-        # 父组继承
+        # 父组继承 — 多个父组是平行路径，任意一个 true 即通过，
+        # 只有全部有明确结果的父组都返回 false 才拒绝。
         parents = group.get("parents", [])
+        best: Optional[bool] = None
         for pname in parents:
             result = self._resolve_group_permission(pname, node, groups, visited)
             if result is True:
                 return True
             if result is False:
-                return False
+                best = False
 
-        return None
+        return best
 
     async def _get_effective_permission(self, user_id: str, node: str) -> Optional[bool]:
         """
@@ -404,17 +407,12 @@ class AstrPerms(Star):
     #  管理员判断
     # ══════════════════════════════════════════
 
-    async def _is_admin(self, event: AstrMessageEvent) -> bool:
-        try:
-            sender_id = str(event.get_sender_id())
-            config = getattr(self.context, "_config", None)
-            if config:
-                admin_ids = config.get("admins_id", [])
-                if isinstance(admin_ids, (list, set, tuple)):
-                    return sender_id in [str(x) for x in admin_ids]
-        except Exception:
-            pass
-        return False
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """判断发送者是否为 AstrBot 管理员。
+
+        优先使用框架内置的 event.is_admin()（框架在 pipeline 阶段自动设置 role）。
+        """
+        return event.is_admin()
 
     def _get_wake_prefixes(self) -> List[str]:
         """
@@ -423,10 +421,10 @@ class AstrPerms(Star):
         """
         result = set()
 
-        # 1. AstrBot 配置的 wake_prefix
+        # 1. AstrBot 配置的 wake_prefix（通过公开 API get_config()）
         try:
-            config = getattr(self.context, "_config", None)
-            if config:
+            config = self.context.get_config()
+            if isinstance(config, dict):
                 wp = config.get("wake_prefix", ["/"])
                 if isinstance(wp, list):
                     for p in wp:
@@ -471,8 +469,11 @@ class AstrPerms(Star):
     # ══════════════════════════════════════════
 
     @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent):
-        """LLM 请求前拦截。处理经 LLM 管道的命令。"""
+    async def on_llm_request(self, event: AstrMessageEvent, req=None):
+        """LLM 请求前拦截。处理经 LLM 管道的命令。
+
+        框架会传入 (event, req) 两个参数，req 为 ProviderRequest。
+        """
         sender_id = str(event.get_sender_id()) if event.get_sender_id() else ""
         if sender_id:
             await self._auto_register(sender_id)
@@ -485,13 +486,15 @@ class AstrPerms(Star):
         if not cmd or cmd == "lp":
             return
 
-        if self._is_admin_bypass() and await self._is_admin(event):
+        if self._is_admin_bypass() and self._is_admin(event):
             return
 
         allowed = await self.check_permission(sender_id, cmd)
         if not allowed:
             logger.info(f"[AstrPerms] LLM 拦截: {sender_id} -> {cmd}")
-            self._pending_check = (sender_id, cmd)
+            event.set_result(event.plain_result(
+                _lp(f"你没有使用 {cmd} 的权限。")
+            ))
             event.stop_event()
 
     # ══════════════════════════════════════════
@@ -501,9 +504,11 @@ class AstrPerms(Star):
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """
-        在消息发送前拦截。
-        event.message_str 此时是 bot 的回复文本而非原始命令，
-        所以从 _pending_check 读取 on_all_message 缓存的命令来检查。
+        在消息发送前拦截。作为最后一道防线，
+        确保 _pending_check 中缓存的被拒命令不会因任何原因绕过拦截。
+
+        注意：ResultDecorateStage 通过 await handler(event) 调用，
+        不会迭代生成器，因此必须用 event.set_result() 而非 yield。
         """
         if not self._pending_check:
             return
@@ -513,15 +518,16 @@ class AstrPerms(Star):
         if not cmd or cmd == "lp":
             return
 
-        if self._is_admin_bypass() and await self._is_admin(event):
+        if self._is_admin_bypass() and self._is_admin(event):
             return
 
         allowed = await self.check_permission(user_id, cmd)
         if not allowed:
-            logger.info(f"[AstrPerms] 拦截: {user_id} -> {cmd}")
-            yield event.plain_result(
+            logger.info(f"[AstrPerms] 装饰拦截: {user_id} -> {cmd}")
+            event.set_result(event.plain_result(
                 _lp(f"你没有使用 {cmd} 的权限。")
-            )
+            ))
+            event.stop_event()
 
     # ══════════════════════════════════════════
     #  权限拦截: on_all_message (所有消息预检)
@@ -551,7 +557,7 @@ class AstrPerms(Star):
         if not cmd or cmd == "lp":
             return
 
-        if self._is_admin_bypass() and await self._is_admin(event):
+        if self._is_admin_bypass() and self._is_admin(event):
             return
 
         allowed = await self.check_permission(sender_id, cmd)
@@ -601,27 +607,28 @@ class AstrPerms(Star):
         sub = parts[0].lower()
         args = parts[1:]
 
-        # 路由
-        handlers = {
-            "user": lambda: self._handle_user(event, args),
-            "group": lambda: self._handle_group(event, args),
-            "search": lambda: self._handle_search(args),
-            "editor": lambda: self._handle_editor(args),
-            "export": lambda: self._handle_export(),
-            "sync": lambda: self._handle_sync(),
-            "info": lambda: self._handle_info(),
-            "verbose": lambda: self._handle_verbose(args),
-        }
-
-        if sub in handlers:
-            result = await handlers[sub]() if callable(handlers[sub]) else handlers[sub]()
+        # 路由到对应子命令
+        if sub == "user":
+            result = await self._handle_user(event, args)
+        elif sub == "group":
+            result = await self._handle_group(event, args)
+        elif sub == "search":
+            result = await self._handle_search(args)
+        elif sub == "editor":
+            result = await self._handle_editor(args)
+        elif sub == "export":
+            result = await self._handle_export()
+        elif sub == "sync":
+            result = await self._handle_sync()
+        elif sub == "info":
+            result = await self._handle_info()
+        elif sub == "verbose":
+            result = await self._handle_verbose(args)
         elif sub in ("help", "-h", "--help", "?"):
             result = self._help_text()
         else:
             result = _lp(f"未知子命令: {sub}。输入 /lp 查看帮助。")
 
-        if callable(result):
-            result = result
         yield event.plain_result(result)
 
     # ══════════════════════════════════════════
@@ -879,7 +886,6 @@ class AstrPerms(Star):
             return _lp(f"组 {name} 不存在。")
         if new_name in data["groups"]:
             return _lp(f"组 {new_name} 已存在。")
-        import copy
         data["groups"][new_name] = copy.deepcopy(data["groups"][name])
         data["groups"][new_name]["members"] = []  # 不复制成员
         await self._save_data(data)
@@ -962,6 +968,9 @@ class AstrPerms(Star):
         if op == "add":
             if parent_name in parents:
                 return _lp(f"组 {gname} 已继承自 {parent_name}。")
+            # 循环引用检测：检查 parent_name 是否已经是 gname 的后代
+            if gname in self._get_all_parents(parent_name, data["groups"]):
+                return _lp(f"无法添加 {parent_name} 为父组：这会造成循环引用。")
             parents.append(parent_name)
             data["groups"][gname]["parents"] = parents
             await self._save_data(data)
