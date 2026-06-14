@@ -1,15 +1,26 @@
 {
+  "default_group": {
+    "type": "string",
+    "label": "默认组名",
+    "default": "default",
+    "description": "所有人自动归属的组名。该组的权限对全局所有人生效"
+  },
   "default_mode": {
-    "type": "select",
+    "type": "string",
     "label": "默认权限模式",
-    "options": ["allow", "deny"],
     "default": "allow",
-    "description": "未明确设置权限时的默认行为：allow=允许所有(白名单模式)，deny=拒绝所有(黑名单模式)"
+    "description": "未设置权限时的最终兜底。填写 allow(全部允许) 或 deny(全部拒绝)"
   },
   "admin_bypass": {
-    "type": "boolean",
+    "type": "bool",
     "label": "管理员豁免",
     "default": true,
     "description": "机器人管理员是否豁免所有权限检查"
+  },
+  "extra_prefixes": {
+    "type": "string",
+    "label": "额外指令前缀",
+    "default": "#",
+    "description": "除 AstrBot wake_prefix 之外额外拦截的指令前缀，多个用英文逗号分隔，如 /,#,!"
   }
 }

@@ -35,7 +35,8 @@ AstrPerms — LuckPerms 风格权限管理插件 for AstrBot
   1. 用户显式权限
   2. 用户所属组的权限 (任意组 true 优先)
   3. 用户所属组的父组权限 (递归继承)
-  4. 默认模式 (config: default_mode = allow / deny)
+  4. 默认组权限 (所有人自动归属，可在 WebUI 配置组名)
+  5. 默认模式 (config: default_mode = allow / deny)
 """
 
 import json
@@ -55,19 +56,15 @@ DEFAULT_DATA: Dict[str, Any] = {
     "groups": {},
 }
 
-# LuckPerms 风格消息前缀
-LP_PREFIX = "&7[&bLP&7] &r"  # (在 AstrBot 中用纯文本模拟)
-
-
 def _lp(msg: str) -> str:
     """包装 LuckPerms 风格输出"""
     return f"[LP] {msg}"
 
 
 # ══════════════════════════════════════════════
-@register("astrperms", "Claude",
+@register("astrperms", "bentianjia",
           "类似 LuckPerms 的权限管理插件，语法与 LP 一致，自动发现已安装插件的指令",
-          "1.0.0", "")
+          "1.0.0", "https://github.com/bentianjia/astrbot_plugin_astrperms")
 class AstrPerms(Star):
     """
     AstrPerms — 全局权限管理插件
@@ -81,6 +78,7 @@ class AstrPerms(Star):
         self._data_cache: Optional[Dict[str, Any]] = None
         self._commands_cache: Optional[List[str]] = None
         self._verbose: bool = False
+        self._pending_check: Optional[tuple] = None  # (user_id, cmd) 从 on_all_message 传到 on_decorating_result
 
     # ══════════════════════════════════════════
     #  指令自动发现
@@ -237,6 +235,12 @@ class AstrPerms(Star):
             self._data_cache["users"] = {}
         if "groups" not in self._data_cache:
             self._data_cache["groups"] = {}
+        # 自动创建默认组
+        default_group = self._get_default_group()
+        if default_group not in self._data_cache["groups"]:
+            self._data_cache["groups"][default_group] = {
+                "permissions": {}, "members": [], "parents": []
+            }
         return self._data_cache
 
     async def _save_data(self, data: Dict[str, Any]) -> None:
@@ -259,6 +263,18 @@ class AstrPerms(Star):
         except Exception:
             pass
         return "allow"
+
+    def _get_default_group(self) -> str:
+        """获取默认组名，所有用户自动归属于该组"""
+        try:
+            cfg = self.context.get_config()
+            if cfg and "default_group" in cfg:
+                val = str(cfg["default_group"]).strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+        return "default"
 
     def _is_admin_bypass(self) -> bool:
         try:
@@ -319,7 +335,8 @@ class AstrPerms(Star):
         优先级:
           1. 用户显式权限
           2. 用户所属组权限（含父组递归继承，任意组 true 优先）
-          3. 默认模式
+          3. 默认组权限（所有人自动归属，含父组递归继承）
+          4. 默认模式
         """
         data = await self._load_data()
         users = data.get("users", {})
@@ -327,24 +344,31 @@ class AstrPerms(Star):
 
         user_entry = users.get(str(user_id))
         if user_entry:
-            # 用户显式权限 — 最高优先级
+            # 1. 用户显式权限 — 最高优先级
             perms = user_entry.get("permissions", {})
             if node in perms:
                 return bool(perms[node])
             if "*" in perms:
                 return bool(perms["*"])
 
-        # 组权限
-        if user_entry:
+            # 2. 用户显式加入的组
             user_groups = user_entry.get("groups", [])
-            best: Optional[bool] = None  # None < False < True
+            best: Optional[bool] = None
             for gname in user_groups:
                 result = self._resolve_group_permission(gname, node, groups)
                 if result is True:
                     return True
                 if result is False:
                     best = False
-            return best
+            if best is not None:
+                return best
+
+        # 3. 默认组 — 所有人自动归属
+        default_group = self._get_default_group()
+        if default_group in groups:
+            result = self._resolve_group_permission(default_group, node, groups)
+            if result is not None:
+                return result
 
         return None
 
@@ -359,7 +383,22 @@ class AstrPerms(Star):
 
     def _ensure_user(self, data: Dict[str, Any], user_id: str) -> None:
         if user_id not in data["users"]:
-            data["users"][user_id] = {"permissions": {}, "groups": []}
+            default_group = self._get_default_group()
+            data["users"][user_id] = {"permissions": {}, "groups": [default_group]}
+
+    async def _auto_register(self, user_id: str) -> None:
+        """
+        新用户首次与 bot 交互时自动写入默认组。
+        类似 LuckPerms 玩家进服自动加入 default 组。
+        """
+        if not user_id:
+            return
+        data = await self._load_data()
+        if user_id not in data["users"]:
+            default_group = self._get_default_group()
+            data["users"][user_id] = {"permissions": {}, "groups": [default_group]}
+            await self._save_data(data)
+            logger.info(f"[AstrPerms] 新用户自动注册: {user_id} -> 组 {default_group}")
 
     # ══════════════════════════════════════════
     #  管理员判断
@@ -368,14 +407,92 @@ class AstrPerms(Star):
     async def _is_admin(self, event: AstrMessageEvent) -> bool:
         try:
             sender_id = str(event.get_sender_id())
-            admin_ids = getattr(self.context, "admin_ids", [])
-            if callable(admin_ids):
-                admin_ids = admin_ids()
-            if isinstance(admin_ids, (list, set, tuple)):
-                return sender_id in [str(x) for x in admin_ids]
+            config = getattr(self.context, "_config", None)
+            if config:
+                admin_ids = config.get("admins_id", [])
+                if isinstance(admin_ids, (list, set, tuple)):
+                    return sender_id in [str(x) for x in admin_ids]
         except Exception:
             pass
         return False
+
+    def _get_wake_prefixes(self) -> List[str]:
+        """
+        合并所有指令前缀：AstrBot wake_prefix + 插件 extra_prefixes。
+        确保像 #new 这种 AstrBot 内置指令也能被拦截。
+        """
+        result = set()
+
+        # 1. AstrBot 配置的 wake_prefix
+        try:
+            config = getattr(self.context, "_config", None)
+            if config:
+                wp = config.get("wake_prefix", ["/"])
+                if isinstance(wp, list):
+                    for p in wp:
+                        s = str(p).strip()
+                        if s:
+                            result.add(s)
+        except Exception:
+            pass
+
+        # / 和 # 作为最低兜底，保证 AstrBot 内置指令也能被拦截
+        result.add("/")
+        result.add("#")
+
+        # 2. 插件 extra_prefixes
+        try:
+            cfg = self.context.get_config()
+            if isinstance(cfg, dict):
+                extra = str(cfg.get("extra_prefixes", "")).strip()
+                for p in extra.split(","):
+                    p = p.strip()
+                    if p:
+                        result.add(p)
+        except Exception:
+            pass
+
+        return list(result)
+
+    def _parse_command(self, msg: str) -> Optional[str]:
+        """从消息中提取指令名。根据 AstrBot 配置的 wake_prefix 匹配。"""
+        if not msg:
+            return None
+        msg = msg.strip()
+        for prefix in self._get_wake_prefixes():
+            if msg.startswith(prefix):
+                rest = msg[len(prefix):]
+                cmd = rest.split()[0].lower() if rest else ""
+                return cmd if cmd else None
+        return None
+
+    # ══════════════════════════════════════════
+    #  权限拦截: on_llm_request (LLM 管道命令)
+    # ══════════════════════════════════════════
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent):
+        """LLM 请求前拦截。处理经 LLM 管道的命令。"""
+        sender_id = str(event.get_sender_id()) if event.get_sender_id() else ""
+        if sender_id:
+            await self._auto_register(sender_id)
+
+        try:
+            msg = event.message_str.strip() if event.message_str else ""
+        except Exception:
+            return
+        cmd = self._parse_command(msg)
+        if not cmd or cmd == "lp":
+            return
+
+        if self._is_admin_bypass() and await self._is_admin(event):
+            return
+
+        allowed = await self.check_permission(sender_id, cmd)
+        if not allowed:
+            logger.info(f"[AstrPerms] LLM 拦截: {sender_id} -> {cmd}")
+            self._pending_check = (sender_id, cmd)
+            event.stop_event()
 
     # ══════════════════════════════════════════
     #  权限拦截: on_decorating_result
@@ -383,55 +500,66 @@ class AstrPerms(Star):
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        """在消息发送前检查权限，拒绝时替换返回内容。"""
-        try:
-            msg = event.message_str.strip() if event.message_str else ""
-        except Exception:
+        """
+        在消息发送前拦截。
+        event.message_str 此时是 bot 的回复文本而非原始命令，
+        所以从 _pending_check 读取 on_all_message 缓存的命令来检查。
+        """
+        if not self._pending_check:
             return
-        if not msg.startswith("/"):
-            return
+        user_id, cmd = self._pending_check
+        self._pending_check = None
 
-        cmd = msg[1:].split()[0].lower() if len(msg) > 1 else ""
         if not cmd or cmd == "lp":
             return
 
-        sender_id = str(event.get_sender_id()) if event.get_sender_id() else ""
         if self._is_admin_bypass() and await self._is_admin(event):
             return
 
-        allowed = await self.check_permission(sender_id, cmd)
+        allowed = await self.check_permission(user_id, cmd)
         if not allowed:
-            logger.info(f"[AstrPerms] 拦截: {sender_id} -> /{cmd}")
+            logger.info(f"[AstrPerms] 拦截: {user_id} -> {cmd}")
             yield event.plain_result(
-                _lp(f"&c你没有使用 &e/{cmd}&c 的权限。")
+                _lp(f"你没有使用 {cmd} 的权限。")
             )
 
     # ══════════════════════════════════════════
-    #  消息级预拦截
+    #  权限拦截: on_all_message (所有消息预检)
     # ══════════════════════════════════════════
 
     @filter.event_message_type(EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
-        """对所有消息进行权限预检。"""
+        """
+        对所有消息进行权限预检，支持任意指令前缀。
+        新用户首次交互自动写入默认组（类似 LuckPerms 进服自动加入 default 组）。
+        缓存待检查命令到 _pending_check，由 on_decorating_result 完成拦截。
+        同时 yield 兜底消息以防 stop_event 阻止了结果装饰链。
+        """
+        self._pending_check = None
+
+        sender_id = str(event.get_sender_id()) if event.get_sender_id() else ""
+
+        # 自动注册新用户 — 首次与 bot 交互即加入默认组
+        if sender_id:
+            await self._auto_register(sender_id)
+
         try:
             msg = event.message_str.strip() if event.message_str else ""
         except Exception:
             return
-        if not msg.startswith("/"):
-            return
-
-        cmd = msg[1:].split()[0].lower() if len(msg) > 1 else ""
+        cmd = self._parse_command(msg)
         if not cmd or cmd == "lp":
             return
 
-        sender_id = str(event.get_sender_id()) if event.get_sender_id() else ""
         if self._is_admin_bypass() and await self._is_admin(event):
             return
 
         allowed = await self.check_permission(sender_id, cmd)
         if not allowed:
+            self._pending_check = (sender_id, cmd)
+            logger.info(f"[AstrPerms] 拦截: {sender_id} -> {cmd}")
             yield event.plain_result(
-                _lp(f"&c你没有使用 &e/{cmd}&c 的权限。")
+                _lp(f"你没有使用 {cmd} 的权限。")
             )
             event.stop_event()
 
@@ -490,7 +618,7 @@ class AstrPerms(Star):
         elif sub in ("help", "-h", "--help", "?"):
             result = self._help_text()
         else:
-            result = _lp(f"&c未知子命令: &e{sub}&c。输入 &e/lp&c 查看帮助。")
+            result = _lp(f"未知子命令: {sub}。输入 /lp 查看帮助。")
 
         if callable(result):
             result = result
@@ -502,11 +630,11 @@ class AstrPerms(Star):
 
     async def _handle_user(self, event: AstrMessageEvent, args: List[str]) -> str:
         if not args:
-            return _lp("&c用法: /lp user <qq号> permission|parent ...")
+            return _lp("用法: /lp user <qq号> permission|parent ...")
 
         user_id = args[0]
         if len(args) < 2:
-            return _lp(f"&c请指定操作: permission 或 parent")
+            return _lp(f"请指定操作: permission 或 parent")
 
         action = args[1].lower()
 
@@ -515,11 +643,11 @@ class AstrPerms(Star):
         elif action == "parent":
             return await self._user_parent(user_id, args[2:])
         else:
-            return _lp(f"&c未知操作: &e{action}&c，可用: permission, parent")
+            return _lp(f"未知操作: {action}，可用: permission, parent")
 
     async def _user_permission(self, user_id: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp user {user_id} permission <set|unset|info> ...")
+            return _lp(f"用法: /lp user {user_id} permission <set|unset|info> ...")
 
         op = args[0].lower()
         data = await self._load_data()
@@ -527,7 +655,7 @@ class AstrPerms(Star):
 
         if op == "set":
             if len(args) < 3:
-                return _lp(f"&c用法: /lp user {user_id} permission set <node> <true|false>")
+                return _lp(f"用法: /lp user {user_id} permission set <node> <true|false>")
             node = args[1].lower()
             val_str = args[2].lower()
             if val_str in ("true", "yes", "1", "t"):
@@ -535,49 +663,49 @@ class AstrPerms(Star):
             elif val_str in ("false", "no", "0", "f"):
                 val = False
             else:
-                return _lp(f"&c值必须为 true 或 false，收到: &e{val_str}")
+                return _lp(f"值必须为 true 或 false，收到: {val_str}")
 
             data["users"][user_id]["permissions"][node] = val
             await self._save_data(data)
-            status = "&atrue" if val else "&cfalse"
+            status = "true" if val else "false"
             return _lp(
-                f"设置 &e{user_id}&r 的权限 &e{node}&r 为 {status}&r。"
+                f"设置 {user_id} 的权限 {node} 为 {status}。"
             )
 
         elif op == "unset":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp user {user_id} permission unset <node>")
+                return _lp(f"用法: /lp user {user_id} permission unset <node>")
             node = args[1].lower()
             perms = data["users"][user_id].get("permissions", {})
             if node in perms:
                 del perms[node]
                 await self._save_data(data)
-                return _lp(f"已取消 &e{user_id}&r 的权限 &e{node}&r。")
-            return _lp(f"&e{user_id}&r 没有对 &e{node}&r 的显式权限设置。")
+                return _lp(f"已取消 {user_id} 的权限 {node}。")
+            return _lp(f"{user_id} 没有对 {node} 的显式权限设置。")
 
         elif op == "info":
             return self._format_user_info(user_id, data)
 
         elif op == "check":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp user {user_id} permission check <node>")
+                return _lp(f"用法: /lp user {user_id} permission check <node>")
             node = args[1].lower()
             effective = await self._get_effective_permission(user_id, node)
             if effective is True:
-                return _lp(f"&e{user_id}&r 对 &e{node}&r 的权限: &atrue")
+                return _lp(f"{user_id} 对 {node} 的权限: true")
             elif effective is False:
-                return _lp(f"&e{user_id}&r 对 &e{node}&r 的权限: &cfalse")
+                return _lp(f"{user_id} 对 {node} 的权限: false")
             else:
                 mode = self._get_default_mode()
-                default = "&atrue" if mode == "allow" else "&cfalse"
-                return _lp(f"&e{user_id}&r 对 &e{node}&r 的权限: {default} &7(默认)")
+                default = "true" if mode == "allow" else "false"
+                return _lp(f"{user_id} 对 {node} 的权限: {default} (默认)")
 
         else:
-            return _lp(f"&c未知操作: &e{op}&c，可用: set, unset, info, check")
+            return _lp(f"未知操作: {op}，可用: set, unset, info, check")
 
     async def _user_parent(self, user_id: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp user {user_id} parent <add|remove|set|clear> [组名]")
+            return _lp(f"用法: /lp user {user_id} parent <add|remove|set|clear> [组名]")
 
         op = args[0].lower()
         data = await self._load_data()
@@ -585,13 +713,13 @@ class AstrPerms(Star):
 
         if op == "add":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp user {user_id} parent add <组名>")
+                return _lp(f"用法: /lp user {user_id} parent add <组名>")
             gname = args[1]
             if gname not in data["groups"]:
-                return _lp(f"&c组 &e{gname}&c 不存在。先用 /lp group {gname} create 创建。")
+                return _lp(f"组 {gname} 不存在。先用 /lp group {gname} create 创建。")
             ug = data["users"][user_id].get("groups", [])
             if gname in ug:
-                return _lp(f"&e{user_id}&r 已在组 &e{gname}&r 中。")
+                return _lp(f"{user_id} 已在组 {gname} 中。")
             ug.append(gname)
             data["users"][user_id]["groups"] = ug
             # 同步 members
@@ -599,29 +727,29 @@ class AstrPerms(Star):
             if user_id not in members:
                 members.append(user_id)
             await self._save_data(data)
-            return _lp(f"已将 &e{user_id}&r 添加到组 &e{gname}&r。")
+            return _lp(f"已将 {user_id} 添加到组 {gname}。")
 
         elif op == "remove":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp user {user_id} parent remove <组名>")
+                return _lp(f"用法: /lp user {user_id} parent remove <组名>")
             gname = args[1]
             ug = data["users"][user_id].get("groups", [])
             if gname not in ug:
-                return _lp(f"&e{user_id}&r 不在组 &e{gname}&r 中。")
+                return _lp(f"{user_id} 不在组 {gname} 中。")
             ug.remove(gname)
             if gname in data["groups"]:
                 members = data["groups"][gname].get("members", [])
                 if user_id in members:
                     members.remove(user_id)
             await self._save_data(data)
-            return _lp(f"已将 &e{user_id}&r 从组 &e{gname}&r 移除。")
+            return _lp(f"已将 {user_id} 从组 {gname} 移除。")
 
         elif op == "set":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp user {user_id} parent set <组名>")
+                return _lp(f"用法: /lp user {user_id} parent set <组名>")
             gname = args[1]
             if gname not in data["groups"]:
-                return _lp(f"&c组 &e{gname}&c 不存在。先用 /lp group {gname} create 创建。")
+                return _lp(f"组 {gname} 不存在。先用 /lp group {gname} create 创建。")
             # 清理旧组的 members
             old_groups = data["users"][user_id].get("groups", [])
             for og in old_groups:
@@ -634,7 +762,7 @@ class AstrPerms(Star):
             if user_id not in members:
                 members.append(user_id)
             await self._save_data(data)
-            return _lp(f"已将 &e{user_id}&r 的父组设置为 &e{gname}&r。")
+            return _lp(f"已将 {user_id} 的父组设置为 {gname}。")
 
         elif op == "clear":
             old_groups = data["users"][user_id].get("groups", [])
@@ -645,10 +773,10 @@ class AstrPerms(Star):
                         members.remove(user_id)
             data["users"][user_id]["groups"] = []
             await self._save_data(data)
-            return _lp(f"已清除 &e{user_id}&r 的所有父组。")
+            return _lp(f"已清除 {user_id} 的所有父组。")
 
         else:
-            return _lp(f"&c未知操作: &e{op}&c，可用: add, remove, set, clear")
+            return _lp(f"未知操作: {op}，可用: add, remove, set, clear")
 
     # ══════════════════════════════════════════
     #  /lp group
@@ -656,7 +784,7 @@ class AstrPerms(Star):
 
     async def _handle_group(self, event: AstrMessageEvent, args: List[str]) -> str:
         if not args:
-            return _lp("&c用法: /lp group <组名|list> ...")
+            return _lp("用法: /lp group <组名|list> ...")
 
         first = args[0]
 
@@ -665,7 +793,7 @@ class AstrPerms(Star):
 
         gname = first
         if len(args) < 2:
-            return _lp(f"&c用法: /lp group {gname} <create|delete|rename|clone|permission|parent|listmembers> ...")
+            return _lp(f"用法: /lp group {gname} <create|delete|rename|clone|permission|parent|listmembers> ...")
 
         action = args[1].lower()
         rest = args[2:]
@@ -692,20 +820,20 @@ class AstrPerms(Star):
             else:
                 return await h(gname, rest)  # rename, clone
         else:
-            return _lp(f"&c未知操作: &e{action}&c，可用: create, delete, rename, clone, permission, parent, listmembers, info")
+            return _lp(f"未知操作: {action}，可用: create, delete, rename, clone, permission, parent, listmembers, info")
 
     async def _group_create(self, name: str) -> str:
         data = await self._load_data()
         if name in data["groups"]:
-            return _lp(f"&c组 &e{name}&c 已存在。")
+            return _lp(f"组 {name} 已存在。")
         data["groups"][name] = {"permissions": {}, "members": [], "parents": []}
         await self._save_data(data)
-        return _lp(f"创建了组 &e{name}&r。")
+        return _lp(f"创建了组 {name}。")
 
     async def _group_delete(self, name: str) -> str:
         data = await self._load_data()
         if name not in data["groups"]:
-            return _lp(f"&c组 &e{name}&c 不存在。")
+            return _lp(f"组 {name} 不存在。")
         # 从所有用户中移除
         for uid, uentry in data["users"].items():
             ug = uentry.get("groups", [])
@@ -718,17 +846,17 @@ class AstrPerms(Star):
                 parents.remove(name)
         del data["groups"][name]
         await self._save_data(data)
-        return _lp(f"删除了组 &e{name}&r。")
+        return _lp(f"删除了组 {name}。")
 
     async def _group_rename(self, name: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp group {name} rename <新名称>")
+            return _lp(f"用法: /lp group {name} rename <新名称>")
         new_name = args[0]
         data = await self._load_data()
         if name not in data["groups"]:
-            return _lp(f"&c组 &e{name}&c 不存在。")
+            return _lp(f"组 {name} 不存在。")
         if new_name in data["groups"]:
-            return _lp(f"&c组 &e{new_name}&c 已存在。")
+            return _lp(f"组 {new_name} 已存在。")
         data["groups"][new_name] = data["groups"].pop(name)
         # 更新所有引用
         for uid, uentry in data["users"].items():
@@ -740,35 +868,35 @@ class AstrPerms(Star):
             if name in parents:
                 parents[parents.index(name)] = new_name
         await self._save_data(data)
-        return _lp(f"已将组 &e{name}&r 重命名为 &e{new_name}&r。")
+        return _lp(f"已将组 {name} 重命名为 {new_name}。")
 
     async def _group_clone(self, name: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp group {name} clone <新名称>")
+            return _lp(f"用法: /lp group {name} clone <新名称>")
         new_name = args[0]
         data = await self._load_data()
         if name not in data["groups"]:
-            return _lp(f"&c组 &e{name}&c 不存在。")
+            return _lp(f"组 {name} 不存在。")
         if new_name in data["groups"]:
-            return _lp(f"&c组 &e{new_name}&c 已存在。")
+            return _lp(f"组 {new_name} 已存在。")
         import copy
         data["groups"][new_name] = copy.deepcopy(data["groups"][name])
         data["groups"][new_name]["members"] = []  # 不复制成员
         await self._save_data(data)
-        return _lp(f"已克隆组 &e{name}&r 为 &e{new_name}&r（未复制成员）。")
+        return _lp(f"已克隆组 {name} 为 {new_name}（未复制成员）。")
 
     async def _group_permission(self, gname: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp group {gname} permission <set|unset|info|check> ...")
+            return _lp(f"用法: /lp group {gname} permission <set|unset|info|check> ...")
         op = args[0].lower()
         data = await self._load_data()
 
         if gname not in data["groups"]:
-            return _lp(f"&c组 &e{gname}&c 不存在。先用 /lp group {gname} create 创建。")
+            return _lp(f"组 {gname} 不存在。先用 /lp group {gname} create 创建。")
 
         if op == "set":
             if len(args) < 3:
-                return _lp(f"&c用法: /lp group {gname} permission set <node> <true|false>")
+                return _lp(f"用法: /lp group {gname} permission set <node> <true|false>")
             node = args[1].lower()
             val_str = args[2].lower()
             if val_str in ("true", "yes", "1", "t"):
@@ -776,116 +904,124 @@ class AstrPerms(Star):
             elif val_str in ("false", "no", "0", "f"):
                 val = False
             else:
-                return _lp(f"&c值必须为 true 或 false，收到: &e{val_str}")
+                return _lp(f"值必须为 true 或 false，收到: {val_str}")
             data["groups"][gname]["permissions"][node] = val
             await self._save_data(data)
-            status = "&atrue" if val else "&cfalse"
-            return _lp(f"设置组 &e{gname}&r 的权限 &e{node}&r 为 {status}&r。")
+            status = "true" if val else "false"
+            return _lp(f"设置组 {gname} 的权限 {node} 为 {status}。")
 
         elif op == "unset":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp group {gname} permission unset <node>")
+                return _lp(f"用法: /lp group {gname} permission unset <node>")
             node = args[1].lower()
             perms = data["groups"][gname].get("permissions", {})
             if node in perms:
                 del perms[node]
                 await self._save_data(data)
-                return _lp(f"已取消组 &e{gname}&r 的权限 &e{node}&r。")
-            return _lp(f"组 &e{gname}&r 没有对 &e{node}&r 的显式权限设置。")
+                return _lp(f"已取消组 {gname} 的权限 {node}。")
+            return _lp(f"组 {gname} 没有对 {node} 的显式权限设置。")
 
         elif op == "info":
             return self._format_group_info(gname, data)
 
         elif op == "check":
             if len(args) < 2:
-                return _lp(f"&c用法: /lp group {gname} permission check <node>")
+                return _lp(f"用法: /lp group {gname} permission check <node>")
             node = args[1].lower()
             result = self._resolve_group_permission(gname, node, data.get("groups", {}))
             if result is True:
-                return _lp(f"组 &e{gname}&r 对 &e{node}&r: &atrue")
+                return _lp(f"组 {gname} 对 {node}: true")
             elif result is False:
-                return _lp(f"组 &e{gname}&r 对 &e{node}&r: &cfalse")
+                return _lp(f"组 {gname} 对 {node}: false")
             else:
-                return _lp(f"组 &e{gname}&r 对 &e{node}&r: &7未设置")
+                return _lp(f"组 {gname} 对 {node}: 未设置")
 
         else:
-            return _lp(f"&c未知操作: &e{op}&c，可用: set, unset, info, check")
+            return _lp(f"未知操作: {op}，可用: set, unset, info, check")
 
     async def _group_parent(self, gname: str, args: List[str]) -> str:
         if not args:
-            return _lp(f"&c用法: /lp group {gname} parent <add|remove> <父组名>")
+            return _lp(f"用法: /lp group {gname} parent <add|remove> <父组名>")
         op = args[0].lower()
         data = await self._load_data()
 
         if gname not in data["groups"]:
-            return _lp(f"&c组 &e{gname}&c 不存在。")
+            return _lp(f"组 {gname} 不存在。")
 
         if len(args) < 2:
-            return _lp(f"&c用法: /lp group {gname} parent {op} <父组名>")
+            return _lp(f"用法: /lp group {gname} parent {op} <父组名>")
 
         parent_name = args[1]
         if parent_name not in data["groups"]:
-            return _lp(f"&c父组 &e{parent_name}&c 不存在。")
+            return _lp(f"父组 {parent_name} 不存在。")
         if parent_name == gname:
-            return _lp("&c不能设置自己为父组。")
+            return _lp("不能设置自己为父组。")
 
         parents = data["groups"][gname].get("parents", [])
 
         if op == "add":
             if parent_name in parents:
-                return _lp(f"组 &e{gname}&r 已继承自 &e{parent_name}&r。")
+                return _lp(f"组 {gname} 已继承自 {parent_name}。")
             parents.append(parent_name)
             data["groups"][gname]["parents"] = parents
             await self._save_data(data)
-            return _lp(f"设置组 &e{gname}&r 继承自 &e{parent_name}&r。")
+            return _lp(f"设置组 {gname} 继承自 {parent_name}。")
 
         elif op == "remove":
             if parent_name not in parents:
-                return _lp(f"组 &e{gname}&r 未继承自 &e{parent_name}&r。")
+                return _lp(f"组 {gname} 未继承自 {parent_name}。")
             parents.remove(parent_name)
             data["groups"][gname]["parents"] = parents
             await self._save_data(data)
-            return _lp(f"已取消组 &e{gname}&r 对 &e{parent_name}&r 的继承。")
+            return _lp(f"已取消组 {gname} 对 {parent_name} 的继承。")
 
         else:
-            return _lp(f"&c未知操作: &e{op}&c，可用: add, remove")
+            return _lp(f"未知操作: {op}，可用: add, remove")
 
     async def _group_list(self) -> str:
         data = await self._load_data()
         groups = data.get("groups", {})
+        default_group = self._get_default_group()
         if not groups:
             return _lp("当前没有任何组。")
-        lines = ["&7&m--------------------", "&b组列表:", ""]
+        lines = ["--------------------", "组列表:", ""]
         for gname, gdata in sorted(groups.items()):
-            count = len(gdata.get("members", []))
             perm_count = len(gdata.get("permissions", {}))
             parent_count = len(gdata.get("parents", []))
             extra = ""
             if parent_count:
-                extra = f" &7(继承: {', '.join(gdata['parents'])})"
-            lines.append(f"  &e{gname}&r — {count} 成员, {perm_count} 权限{extra}")
-        lines.append("&7&m--------------------")
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+                extra = f" (继承: {', '.join(gdata['parents'])})"
+            if gname == default_group:
+                member_str = "所有用户"
+            else:
+                count = len(gdata.get("members", []))
+                member_str = f"{count} 成员"
+            lines.append(f"  {gname} — {member_str}, {perm_count} 权限{extra}")
+        lines.append("--------------------")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     async def _group_listmembers(self, gname: str) -> str:
         data = await self._load_data()
         group = data["groups"].get(gname)
         if not group:
-            return _lp(f"&c组 &e{gname}&c 不存在。")
+            return _lp(f"组 {gname} 不存在。")
+        default_group = self._get_default_group()
+        if gname == default_group:
+            return _lp(f"组 {gname} 为默认组，所有用户自动归属，不维护成员列表。")
         members = group.get("members", [])
         if not members:
-            return _lp(f"组 &e{gname}&r 暂无成员。")
-        lines = ["&7&m--------------------", f"&b组 &e{gname}&b 成员 ({len(members)}):", ""]
+            return _lp(f"组 {gname} 暂无成员。")
+        lines = ["--------------------", f"组 {gname} 成员 ({len(members)}):", ""]
         for m in sorted(members):
             uentry = data["users"].get(m, {})
             perms = uentry.get("permissions", {})
             extra = ""
             if perms:
-                items = [f"{'&a' if v else '&c'}{k}" for k, v in sorted(perms.items())]
-                extra = f" &7(个人: {', '.join(items)}&7)"
-            lines.append(f"  &e{m}{extra}")
-        lines.append("&7&m--------------------")
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+                items = [f"{'[允许]' if v else '[禁止]'}{k}" for k, v in sorted(perms.items())]
+                extra = f" (个人: {', '.join(items)})"
+            lines.append(f"  {m}{extra}")
+        lines.append("--------------------")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     async def _group_info(self, gname: str) -> str:
         data = await self._load_data()
@@ -899,16 +1035,16 @@ class AstrPerms(Star):
         query = args[0] if args else ""
         results = self._suggest_commands(query, limit=30)
         if not results:
-            return _lp(f"&c未找到匹配 &e{query}&c 的指令。")
+            return _lp(f"未找到匹配 {query} 的指令。")
         count = len(self._discover_commands())
         header = _lp(
-            f"搜索 &e{query}&r 的结果 &7(共发现 {count} 个指令):"
+            f"搜索 {query} 的结果 (共发现 {count} 个指令):"
         )
-        lines = [header, "&7&m--------------------"]
+        lines = [header, "--------------------"]
         for cmd in results:
-            lines.append(f"  &e/{cmd}")
-        lines.append("&7&m--------------------")
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+            lines.append(f"  /{cmd}")
+        lines.append("--------------------")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     # ══════════════════════════════════════════
     #  /lp editor
@@ -918,17 +1054,17 @@ class AstrPerms(Star):
         """简易交互式编辑器"""
         if args and args[0].lower() == "start":
             return _lp(
-                "&7AstrBot 暂不支持交互式编辑器。\n"
-                "&7请使用以下命令管理权限:\n"
-                "&e/lp user <qq> permission set <node> true|false\n"
-                "&e/lp group <group> permission set <node> true|false\n"
-                "&e/lp search [query] &7— 搜索可用指令\n"
-                "&e/lp export &7— 导出全部数据"
+                "AstrBot 暂不支持交互式编辑器。\n"
+                "请使用以下命令管理权限:\n"
+                "/lp user <qq> permission set <node> true|false\n"
+                "/lp group <group> permission set <node> true|false\n"
+                "/lp search [query] — 搜索可用指令\n"
+                "/lp export — 导出全部数据"
             )
         return _lp(
-            "&7编辑器用法: &e/lp editor start\n"
-            "&7或直接使用 &e/lp user|group &7命令管理。\n"
-            "&7用 &e/lp search&7 查看所有可用指令。"
+            "编辑器用法: /lp editor start\n"
+            "或直接使用 /lp user|group 命令管理。\n"
+            "用 /lp search 查看所有可用指令。"
         )
 
     # ══════════════════════════════════════════
@@ -955,33 +1091,33 @@ class AstrPerms(Star):
         data = await self._load_data()
         cmds = self._discover_commands()
         mode = self._get_default_mode()
-        mode_str = "&a全部允许 (allow)" if mode == "allow" else "&c全部拒绝 (deny)"
+        mode_str = "全部允许 (allow)" if mode == "allow" else "全部拒绝 (deny)"
         lines = [
-            "&7&m--------------------",
-            "&bAstrPerms 信息",
+            "--------------------",
+            "AstrPerms 信息",
             "",
             f"  默认模式: {mode_str}",
-            f"  用户数: &e{len(data.get('users', {}))}",
-            f"  组数: &e{len(data.get('groups', {}))}",
-            f"  可用指令数: &e{len(cmds)}",
-            f"  管理员豁免: &e{self._is_admin_bypass()}",
-            f"  Verbose: &e{self._verbose}",
-            "&7&m--------------------",
+            f"  用户数: {len(data.get('users', {}))}",
+            f"  组数: {len(data.get('groups', {}))}",
+            f"  可用指令数: {len(cmds)}",
+            f"  管理员豁免: {self._is_admin_bypass()}",
+            f"  Verbose: {self._verbose}",
+            "--------------------",
         ]
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     async def _handle_verbose(self, args: List[str]) -> str:
         if not args:
-            return _lp(f"verbose 当前: &e{'on' if self._verbose else 'off'}")
+            return _lp(f"verbose 当前: {'on' if self._verbose else 'off'}")
         val = args[0].lower()
         if val in ("on", "true", "1"):
             self._verbose = True
-            return _lp("verbose 已开启 &a(on)&r。")
+            return _lp("verbose 已开启 (on)。")
         elif val in ("off", "false", "0"):
             self._verbose = False
-            return _lp("verbose 已关闭 &c(off)&r。")
+            return _lp("verbose 已关闭 (off)。")
         else:
-            return _lp(f"&c用法: /lp verbose <on|off>")
+            return _lp(f"用法: /lp verbose <on|off>")
 
     # ══════════════════════════════════════════
     #  格式化输出
@@ -991,8 +1127,9 @@ class AstrPerms(Star):
         uentry = data["users"].get(user_id, {})
         perms = uentry.get("permissions", {})
         ug = uentry.get("groups", [])
+        default_group = self._get_default_group()
 
-        lines = ["&7&m--------------------", f"&b用户 &e{user_id}&b 权限信息", ""]
+        lines = ["--------------------", f"用户 {user_id} 权限信息", ""]
 
         # 组
         if ug:
@@ -1009,26 +1146,44 @@ class AstrPerms(Star):
             for gname in ug:
                 collect_parents(gname)
 
-            lines.append(f"  父组: &e{', '.join(ug)}")
+            labels = []
+            for g in ug:
+                label = g
+                if g == default_group:
+                    label = f"{g} (默认)"
+                labels.append(label)
+            lines.append(f"  父组: {', '.join(labels)}")
             if all_parents:
-                lines.append(f"  继承链: &7{', '.join(sorted(all_parents))}")
+                lines.append(f"  继承链: {', '.join(sorted(all_parents))}")
             lines.append("")
+        else:
+            # 即使没有任何组，也标注默认组
+            if default_group in data["groups"]:
+                lines.append(f"  父组: {default_group} (默认，所有人)")
+                lines.append("")
 
         # 权限
         if perms:
             lines.append("  权限:")
             for node, val in sorted(perms.items()):
-                icon = "&a✔" if val else "&c✘"
-                lines.append(f"    {icon} &e{node}")
+                icon = "✔" if val else "✘"
+                lines.append(f"    {icon} {node}")
         else:
-            lines.append("  权限: &7(无显式设置)")
+            lines.append("  权限: (无显式设置)")
 
-        # 有效权限
+        # 有效权限 — 纳入默认组
         all_nodes = set(perms.keys())
         for gname in ug:
             g = data["groups"].get(gname, {})
             all_nodes.update(g.get("permissions", {}).keys())
             for p in self._get_all_parents(gname, data["groups"]):
+                pg = data["groups"].get(p, {})
+                all_nodes.update(pg.get("permissions", {}).keys())
+        # 也纳入默认组（即使用户没有 ug）
+        if default_group in data["groups"]:
+            dg = data["groups"][default_group]
+            all_nodes.update(dg.get("permissions", {}).keys())
+            for p in self._get_all_parents(default_group, data["groups"]):
                 pg = data["groups"].get(p, {})
                 all_nodes.update(pg.get("permissions", {}).keys())
 
@@ -1037,8 +1192,7 @@ class AstrPerms(Star):
             lines.append("  有效权限 (含组继承):")
             for node in sorted(all_nodes):
                 if node in perms:
-                    continue  # 已在上面显示
-                # 计算有效值
+                    continue
                 effective = None
                 for gname in ug:
                     val = self._resolve_group_permission(gname, node, data.get("groups", {}))
@@ -1047,12 +1201,17 @@ class AstrPerms(Star):
                         break
                     if val is False:
                         effective = False
-                icon = "&a✔" if effective else "&c✘" if effective is False else "&7-"
+                # 也检查默认组
+                if effective is None and default_group in data["groups"]:
+                    val = self._resolve_group_permission(default_group, node, data.get("groups", {}))
+                    if val is not None:
+                        effective = val
+                icon = "✔" if effective else "✘" if effective is False else "-"
                 source = "组" if effective is not None else "默认"
-                lines.append(f"    {icon} &e{node} &7({source})")
+                lines.append(f"    {icon} {node} ({source})")
 
-        lines.append("&7&m--------------------")
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+        lines.append("--------------------")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     def _get_all_parents(self, gname: str, groups: Dict[str, Any]) -> Set[str]:
         """递归获取组的所有祖先"""
@@ -1070,40 +1229,46 @@ class AstrPerms(Star):
         perms = group.get("permissions", {})
         members = group.get("members", [])
         parents = group.get("parents", [])
+        default_group = self._get_default_group()
+
+        if gname == default_group:
+            member_line = "  成员: 所有用户 (全局默认)"
+        else:
+            member_line = f"  成员: {len(members)} 人"
 
         lines = [
-            "&7&m--------------------",
-            f"&b组 &e{gname}&b 信息",
+            "--------------------",
+            f"组 {gname} 信息",
             "",
-            f"  权重: &e{len(members)} 成员",
+            member_line,
         ]
 
         if parents:
-            lines.append(f"  继承自: &e{', '.join(parents)}")
+            lines.append(f"  继承自: {', '.join(parents)}")
             all_parents = self._get_all_parents(gname, data.get("groups", {}))
             if all_parents:
-                lines.append(f"  完整继承链: &7{', '.join(sorted(all_parents))}")
+                lines.append(f"  完整继承链: {', '.join(sorted(all_parents))}")
 
         lines.append("")
 
         if perms:
             lines.append("  权限:")
             for node, val in sorted(perms.items()):
-                icon = "&a✔" if val else "&c✘"
-                lines.append(f"    {icon} &e{node}")
+                icon = "✔" if val else "✘"
+                lines.append(f"    {icon} {node}")
         else:
-            lines.append("  权限: &7(无显式设置)")
+            lines.append("  权限: (无显式设置)")
 
-        if members:
+        if members and gname != default_group:
             lines.append("")
             lines.append(f"  成员 ({len(members)}):")
             for m in sorted(members)[:30]:
-                lines.append(f"    &e{m}")
+                lines.append(f"    {m}")
             if len(members) > 30:
-                lines.append(f"    &7... 及其他 {len(members) - 30} 人")
+                lines.append(f"    ... 及其他 {len(members) - 30} 人")
 
-        lines.append("&7&m--------------------")
-        return "\n".join(lines).replace("&7&m--------------------", "──────────────")
+        lines.append("--------------------")
+        return "\n".join(lines).replace("--------------------", "──────────────")
 
     # ══════════════════════════════════════════
     #  帮助
@@ -1111,40 +1276,42 @@ class AstrPerms(Star):
 
     def _help_text(self) -> str:
         return (
-            "&b&lAstrPerms &r&7— LuckPerms 风格权限管理\n"
+            "AstrPerms — LuckPerms 风格权限管理\n"
             "\n"
-            "&7&m------------------------------------------------\n"
-            "&e/lp user <qq> permission set <node> true|false\n"
-            "&e/lp user <qq> permission unset <node>\n"
-            "&e/lp user <qq> permission info\n"
-            "&e/lp user <qq> permission check <node>\n"
-            "&e/lp user <qq> parent add <group>\n"
-            "&e/lp user <qq> parent remove <group>\n"
-            "&e/lp user <qq> parent set <group>\n"
-            "&e/lp user <qq> parent clear\n"
+            "------------------------------------------------\n"
+            "/lp user <qq> permission set <node> true|false\n"
+            "/lp user <qq> permission unset <node>\n"
+            "/lp user <qq> permission info\n"
+            "/lp user <qq> permission check <node>\n"
+            "/lp user <qq> parent add <group>\n"
+            "/lp user <qq> parent remove <group>\n"
+            "/lp user <qq> parent set <group>\n"
+            "/lp user <qq> parent clear\n"
             "\n"
-            "&e/lp group <group> permission set <node> true|false\n"
-            "&e/lp group <group> permission unset <node>\n"
-            "&e/lp group <group> permission info\n"
-            "&e/lp group <group> parent add <group>\n"
-            "&e/lp group <group> parent remove <group>\n"
-            "&e/lp group <group> create\n"
-            "&e/lp group <group> delete\n"
-            "&e/lp group <group> rename <new>\n"
-            "&e/lp group <group> clone <new>\n"
-            "&e/lp group <group> listmembers\n"
-            "&e/lp group list\n"
+            "/lp group <group> permission set <node> true|false\n"
+            "/lp group <group> permission unset <node>\n"
+            "/lp group <group> permission info\n"
+            "/lp group <group> parent add <group>\n"
+            "/lp group <group> parent remove <group>\n"
+            "/lp group <group> create\n"
+            "/lp group <group> delete\n"
+            "/lp group <group> rename <new>\n"
+            "/lp group <group> clone <new>\n"
+            "/lp group <group> listmembers\n"
+            "/lp group list\n"
             "\n"
-            "&e/lp search [query]    &7搜索可用指令\n"
-            "&e/lp editor             &7编辑器入口\n"
-            "&e/lp export             &7导出全部数据\n"
-            "&e/lp sync               &7重新加载\n"
-            "&e/lp info               &7插件信息\n"
-            "&e/lp verbose on|off     &7调试模式\n"
-            "&7&m------------------------------------------------\n"
-            "&7权限优先级: 用户 > 组(含父组递归) > 默认\n"
-            "&7通配符 &e*&7 代表所有指令\n"
-            "&7仅管理员可使用 &e/lp&7 命令"
+            "/lp search [query]    搜索可用指令\n"
+            "/lp editor             编辑器入口\n"
+            "/lp export             导出全部数据\n"
+            "/lp sync               重新加载\n"
+            "/lp info               插件信息\n"
+            "/lp verbose on|off     调试模式\n"
+            "------------------------------------------------\n"
+            "权限优先级: 用户 > 组(含父组递归) > 默认组(所有人) > 默认模式\n"
+            "通配符 * 代表所有指令\n"
+            "默认组在 WebUI 配置，所有人自动归属，用于全局权限控制\n"
+            "AstrBot 管理员 = LuckPerms 中的 lp.* 权限\n"
+            "管理员可使用 /lp 命令且豁免所有权限检查"
         )
 
     # ══════════════════════════════════════════
